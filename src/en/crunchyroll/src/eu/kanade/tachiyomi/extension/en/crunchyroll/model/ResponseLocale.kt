@@ -2,7 +2,7 @@ package eu.kanade.tachiyomi.extension.en.crunchyroll.model
 
 import com.google.gson.annotations.SerializedName
 
-data class PageLocale(
+data class ResponseLocale(
     @SerializedName(value = "enUS")
-    val enUS: LocaleLinks
+    val enUS: Map<String, String>
 )

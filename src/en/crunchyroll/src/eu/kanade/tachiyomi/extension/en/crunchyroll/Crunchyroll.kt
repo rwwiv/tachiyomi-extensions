@@ -1,9 +1,12 @@
 package eu.kanade.tachiyomi.extension.en.crunchyroll
 
+import android.webkit.CookieManager
 import com.google.gson.FieldNamingPolicy
 import com.google.gson.GsonBuilder
-import eu.kanade.tachiyomi.extension.en.crunchyroll.model.ChapterInfo
-import eu.kanade.tachiyomi.extension.en.crunchyroll.model.VolumeData
+import eu.kanade.tachiyomi.extension.en.crunchyroll.model.Chapters
+import eu.kanade.tachiyomi.extension.en.crunchyroll.model.Pages
+import eu.kanade.tachiyomi.extension.en.crunchyroll.model.SeriesInfo
+import eu.kanade.tachiyomi.lib.ratelimit.RateLimitInterceptor
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -11,18 +14,17 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
-import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.CacheControl
+import eu.kanade.tachiyomi.source.online.HttpSource
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 import rx.Observable
+import java.lang.Exception
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
-class Crunchyroll : ParsedHttpSource() {
+class Crunchyroll : HttpSource() {
     override val name = "Crunchyroll"
 
     override val baseUrl = "https://www.crunchyroll.com"
@@ -31,104 +33,159 @@ class Crunchyroll : ParsedHttpSource() {
 
     override val supportsLatest = true
 
-    override val client: OkHttpClient
-        get() = network.cloudflareClient.newBuilder()
-            .addInterceptor(CrunchyrollImageInterceptor())
-            .build()
+    private val rateLimitInterceptor = RateLimitInterceptor(1)
+
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor(rateLimitInterceptor)
+        .connectTimeout(1, TimeUnit.MINUTES)
+        .readTimeout(1, TimeUnit.MINUTES)
+        .writeTimeout(1, TimeUnit.MINUTES)
+        .addInterceptor(CrunchyrollImageInterceptor())
+        .build()
 
     private val gson = GsonBuilder()
         .setLenient()
         .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
         .create()
 
+    private val cookieString: String
+        get() {
+            return CookieManager.getInstance().getCookie(baseUrl) ?: throw Exception("Open WebView to login")
+        }
+
+    private val sessionId: String
+        get() {
+            for (string in cookieString.split("; ")) {
+                val cookie = string.split("=")
+
+                if (cookie[0] == "session_id") {
+                    return cookie[1]
+                }
+            }
+            throw Exception("Open WebView to login")
+        }
+
+    private fun addParams(urlString: String, vararg params: Pair<String, String>): String {
+        var tempString = urlString +
+            "?device_id=$DEVICE_ID" +
+            "&device_type=$DEVICE_TYPE" +
+            "&locale=enUS" +
+            "&auth=manga_auth" // Value not checked (login checked via cookie), but key needs to be included
+
+        for (param in params) {
+            tempString += "&${param.first}=${param.second}"
+        }
+
+        return tempString
+    }
+
     // Popular
 
-    override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/comics/manga", headers)
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        val url = "$API_MANGA_URL/series"
+        val req = GET(addParams(url, Pair("session_id", sessionId)), headers)
+        return client.newCall(req)
+            .asObservableSuccess()
+            .map { response ->
+                popularMangaParse(response)
+            }
     }
+
+    override fun popularMangaRequest(page: Int) = throw UnsupportedOperationException("Not used.")
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val mangasPage = super.popularMangaParse(response)
+        val allSeries = gson.fromJson(response.body()!!.string(), Array<SeriesInfo>::class.java)
 
-        if (mangasPage.mangas.isEmpty()) throw Exception(COUNTRY_NOT_SUPPORTED)
+        val mangaList = mutableListOf<SManga>()
 
-        return mangasPage
+        allSeries.forEach { manga ->
+            if (manga.locale != null) {
+                mangaList.add(
+                    seriesInfo2SManga(manga)
+                )
+            }
+        }
+
+        return MangasPage(mangaList, false)
     }
 
-    override fun popularMangaSelector() = "div#main_content li.group-item a"
-
-    override fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        title = element.select("span.series-title").first().text()
-        thumbnail_url = element.select("img").first()?.attr("src")
-        url = element.attr("href")
+    private fun seriesInfo2SManga(seriesInfo: SeriesInfo): SManga = SManga.create().apply {
+        if (seriesInfo.locale != null) {
+            title = seriesInfo.locale.enUS["name"].toString()
+            description = seriesInfo.locale.enUS["description"].toString().replace("\\r\\n", "\n")
+            author = seriesInfo.authors
+            artist = seriesInfo.artist
+            thumbnail_url = seriesInfo.locale.enUS["thumb_url"].toString()
+            // Cheat storing the series id as a URL param since there's no field we can use
+            url = "/comics/manga${seriesInfo.url}/volumes?series_id=${URLEncoder.encode(seriesInfo.seriesId, "UTF-8")}"
+            status = SManga.LICENSED
+            initialized = true
+        }
     }
-
-    override fun popularMangaNextPageSelector(): String? = null
 
     // Latest
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        return GET("$baseUrl/comics/manga/updated", headers)
-    }
+    override fun fetchLatestUpdates(page: Int) = fetchPopularManga(page)
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val mangasPage = super.latestUpdatesParse(response)
+    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException("Not used.")
 
-        if (mangasPage.mangas.isEmpty()) throw Exception(COUNTRY_NOT_SUPPORTED)
-
-        return mangasPage
-    }
-
-    override fun latestUpdatesSelector(): String = popularMangaSelector()
-
-    override fun latestUpdatesFromElement(element: Element): SManga =
-        popularMangaFromElement(element)
-
-    override fun latestUpdatesNextPageSelector(): String? = null
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // Search
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/search?q=$query&o=mg", headers)
+    private var globalQuery: String = ""
+
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        val url = "$API_MANGA_URL/list_series"
+        val req = GET(addParams(url, Pair("session_id", sessionId)), headers)
+        globalQuery = query
+        return client.newCall(req)
+            .asObservableSuccess()
+            .map { response ->
+                searchMangaParse(response)
+            }
     }
 
-    override fun searchMangaSelector(): String = "ul.search-results>li>a"
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = throw UnsupportedOperationException("Not used.")
 
-    override fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        title = element.select("span.info span.name").first().text()
-        thumbnail_url = element.select("span.mug img").first()?.attr("src")
-        url = element.attr("href")
+    override fun searchMangaParse(response: Response): MangasPage {
+        val allSeries = gson.fromJson(response.body()!!.string(), Array<SeriesInfo>::class.java)
+
+        val mangaList = mutableListOf<SManga>()
+
+        val filteredList = allSeries.filter { manga ->
+            manga.locale != null && manga.locale.enUS["name"].toString().contains(globalQuery, ignoreCase = true)
+        }
+
+        filteredList.forEach { manga ->
+            if (manga.locale != null) {
+                mangaList.add(
+                    seriesInfo2SManga(manga)
+                )
+            }
+        }
+
+        return MangasPage(mangaList, false)
     }
-
-    override fun searchMangaNextPageSelector(): String? = null
 
     // Details
 
-    override fun mangaDetailsParse(document: Document): SManga {
-        val seriesInfo = document.select("div#sidebar").first()
-
-        val desc = seriesInfo.select("p.description").first().text()
-        val descMore = seriesInfo.select("p.description span.more").first()?.text()
-
-        val descriptionText: String = if (descMore != "") {
-            desc.substringBefore(" ... more")
-        } else {
-            desc
-        }
-
-        return SManga.create().apply {
-            status = SManga.UNKNOWN
-            description = descriptionText
-            author = seriesInfo.select("span:contains(Author)").first().parent().text()
-            artist = seriesInfo.select("span:contains(Artist)").first().parent().text()
-            thumbnail_url = seriesInfo.select("i.poster").first()?.attr("src")
-        }
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        return Observable.just(manga)
     }
+
+    override fun mangaDetailsParse(response: Response) = throw UnsupportedOperationException("Not used.")
 
     // Chapters
 
+    private var mangaUrl = ""
+
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
-        return client.newCall(chapterListRequest(manga))
+        val url = "$API_MANGA_URL/list_chapters"
+        val seriesId = URLDecoder.decode(manga.url.substringAfter("?series_id="), "UTF-8")
+        val req = GET(addParams(url, Pair("session_id", sessionId), Pair("series_id", seriesId)), headers)
+        mangaUrl = manga.url
+        return client.newCall(req)
             .asObservableSuccess()
             .map { response ->
                 chapterListParse(response)
@@ -136,145 +193,73 @@ class Crunchyroll : ParsedHttpSource() {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val mangaPage = response.asJsoup()
+        val allChapters = gson.fromJson(response.body()!!.string(), Chapters::class.java)
 
-        val volumeList: List<Element> =
-            mangaPage.select("div#showview_content ul.volume-list li")
+        val chapterList = mutableListOf<SChapter>()
 
-        val script = mangaPage.select("script:containsData(manga_premium)").first().data()
-        val premiumUser = script.substringAfter("manga_premium:'").substringBefore("'")
-        val mediaType = script.substringAfter("media_type: '").substringBefore("'")
-
-        val chapterList: MutableList<SChapter> = mutableListOf()
-
-        volumeList.forEach { element ->
-            val id = element.attr("volume_id")
-            val newHeaders = headersBuilder()
-                .add("Referer", response.request().url().toString())
-                .build()
-
-            var index = 0
-            var ajaxUrl = "$baseUrl/ajax/?req=RpcApiManga_GetMangaCollectionCarouselPage" +
-                "&volume_id=$id" +
-                "&first_index=$index" +
-                "&media_type=$mediaType" +
-                "&manga_premium=$premiumUser}"
-
-            val content = stringFromAjaxRequest(GET(ajaxUrl, newHeaders))
-
-            val objList: MutableList<VolumeData> = mutableListOf()
-
-            val jsonObj = gson.fromJson(content, VolumeData::class.java)
-
-            objList.add(jsonObj)
-
-            if (jsonObj.data!!.entries.size == 5) {
-                try {
-                    while (true) {
-                        index += 5
-                        ajaxUrl = "$baseUrl/ajax/?req=RpcApiManga_GetMangaCollectionCarouselPage" +
-                            "&volume_id=$id" +
-                            "&first_index=$index" +
-                            "&media_type=$mediaType" +
-                            "&manga_premium=$premiumUser}"
-                        val loopedContent = stringFromAjaxRequest(GET(ajaxUrl, newHeaders))
-                        val loopedJsonObj = gson.fromJson(loopedContent, VolumeData::class.java)
-                        if (loopedJsonObj.data == null) break
-                        objList.add(loopedJsonObj)
+        for (chapter in allChapters.chapters) {
+            if (chapter.locale != null) {
+                chapterList.add(
+                    SChapter.create().apply {
+                        val tempUrl = mangaUrl
+                            .substringBefore("/volumes")
+                            .replace("/comics", "")
+                        url = "$tempUrl/read/${chapter.number.toString().substringBefore(".00")}?chapter_id=${chapter.chapterId}"
+                        chapter_number = chapter.number
+                        name = chapter.locale.enUS["name"].toString()
+                        scanlator = "Crunchyroll"
                     }
-                } finally {
-                }
-            }
-
-            objList.forEach { v ->
-                v.data!!.values.forEach { string ->
-                    chapterList.addAll(parseCarouselHtmlString(string, premiumUser))
-                }
+                )
             }
         }
 
         return chapterList.sortedByDescending { it.chapter_number }
     }
 
-    private fun stringFromAjaxRequest(request: Request): String {
-        val res = client.newCall(request)
-            .execute()
+    // Pages
 
-        return res.body()!!.string()
-            .substringAfter("/*-secure-")
-            .substringBeforeLast("*/")
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        val res = client.newCall(pageListRequest(chapter)).execute()
+        if (res.code() >= 400) {
+            throw Exception("Couldn't fetch chapter\nMake sure to log in via WebView")
+        }
+
+        return client.newCall(pageListRequest(chapter))
+            .asObservableSuccess()
+            .map { response ->
+                pageListParse(response)
+            }
     }
 
-    private fun parseCarouselHtmlString(string: String, premiumUser: String): List<SChapter> {
-        val html = Jsoup.parse(string)
+    override fun pageListRequest(chapter: SChapter): Request {
+        val newHeaders = headers.newBuilder()
+            .add("Referer", baseUrl)
+            .build()
+        val url = "$API_MANGA_URL/list_chapter"
+        val chapterId = URLDecoder.decode(chapter.url.substringAfter("?chapter_id="), "UTF-8")
+        return GET(addParams(url, Pair("session_id", sessionId), Pair("chapter_id", chapterId)), newHeaders)
+    }
 
-        val chapterList: MutableList<SChapter> = mutableListOf()
+    override fun pageListParse(response: Response): List<Page> {
+        val pages = gson.fromJson(response.body()!!.string(), Pages::class.java)
 
-        val chapterSubList = html.select("div.collection-carousel-media-link")
+        val pageList = mutableListOf<Page>()
 
-        chapterSubList.forEach { e ->
-            val premiumChapter = e.select("span.collection-carousel-premium-crown").first()
-            if ((premiumUser == "1" && premiumChapter != null) || premiumChapter == null) {
-                chapterList.add(genChapter(e))
+        pages.pages.forEach { page ->
+            if (page.locale != null) {
+                pageList.add(
+                    Page(
+                        index = page.number.toInt(),
+                        imageUrl = page.locale.enUS["encrypted_composed_image_url"]
+                    )
+                )
             }
         }
 
-        return chapterList
+        return pageList
     }
 
-    private fun genChapter(element: Element): SChapter = SChapter.create().apply {
-        url = element.select("a.link").first().attr("href")
-        name = element.select("a.link").first().attr("title")
-        chapter_number =
-            element.select("div.collection-carousel-overlay")
-                .first()
-                .text()
-                .substringAfter("Ch. ")
-                .toFloat()
-        scanlator = "Crunchyroll"
-    }
-
-    override fun chapterListRequest(manga: SManga): Request {
-        return GET("${baseUrl}${manga.url}", headers)
-    }
-
-    override fun chapterListSelector(): String {
-        throw UnsupportedOperationException("Not used.")
-    }
-
-    override fun chapterFromElement(element: Element): SChapter {
-        throw UnsupportedOperationException("Not used.")
-    }
-
-    // Pages
-
-    override fun pageListParse(document: Document): List<Page> {
-        val initScript = document.select("script:containsData(chapterId)").first().data()
-
-        val chapterId = initScript.substringAfter("chapterId: \"").substringBefore("\",")
-        val sessionId = initScript.substringAfter("sessionId: \"").substringBefore("\",")
-
-        val req = GET(
-            "$API_URL/list_chapter?auth=manga_auth&chapter_id=$chapterId&session_id=$sessionId",
-            headers,
-            CacheControl.FORCE_NETWORK
-        )
-        val res = client.newCall(req).execute()
-
-        val chapterInfo = gson.fromJson(res.body()!!.string(), ChapterInfo::class.java)
-
-        val pageCount = chapterInfo.pages.size
-
-        return IntRange(1, pageCount)
-            .map {
-                val url = chapterInfo.pages[it - 1].locale.enUS.encryptedComposedImageUrl
-                Page(it, url = document.location(), imageUrl = url)
-            }
-    }
-
-    override fun imageUrlParse(document: Document): String {
-        throw UnsupportedOperationException("Not used.")
-    }
+    // Image
 
     override fun imageRequest(page: Page): Request {
         val newHeaders = headersBuilder()
@@ -285,10 +270,15 @@ class Crunchyroll : ParsedHttpSource() {
         return GET(page.imageUrl!!, newHeaders)
     }
 
-    companion object {
-        private const val API_URL = "https://api-manga.crunchyroll.com"
+    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException("Not used.")
 
-        private const val COUNTRY_NOT_SUPPORTED = "Your country is not supported, try using a VPN."
+    companion object {
+        private const val API_URL = "https://api.crunchyroll.com"
+        private const val API_MANGA_URL = "https://api-manga.crunchyroll.com"
+
+        private const val DEVICE_ID = "2fa9e3886d132f87"
+        private const val DEVICE_TYPE = "com.crunchyroll.manga.android"
+        private const val ACCESS_TOKEN = "FLpcfZH4CbW4muO"
 
         private const val TAG = "Crunchyroll"
     }
